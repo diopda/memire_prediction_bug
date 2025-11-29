@@ -1,0 +1,26 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+
+# Données & matrices volumineuses
+combined_data/
+combined_data_cc/
+matrice_decoded/
+matrice_données/
+out/
+runs/
+wandb/
+
+# Fichiers lourds génériques
+*.csv
+*.npz
+*.pkl
+*.keras
+*.h5
+
+# Figures et visualisations
+*.png
+
+# Documents Word
+*.docx
