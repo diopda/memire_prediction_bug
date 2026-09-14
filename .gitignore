@@ -11,6 +11,9 @@ matrice_données/
 out/
 runs/
 wandb/
+données_final/
+logs/
+*.log
 
 # Fichiers lourds génériques
 *.csv
@@ -19,7 +22,7 @@ wandb/
 *.keras
 *.h5
 
-# Figures et visualisations
+# Figures et visualisations (PNG intermediaires seulement -- les .pdf finaux restent suivis)
 *.png
 
 # Documents Word

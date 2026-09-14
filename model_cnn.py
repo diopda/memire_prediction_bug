@@ -1,9 +1,9 @@
 # ============================================================
-# Cross-Project Bug Prediction (Transformer) 
+# Cross-Project Bug Prediction (CNN) 
 # - Pool 80/20 (train/val) OU mode classique train/val
 # - Preprocessing: scaler fit sur TRAIN uniquement
 # - Imbalance:
-#     * SMOTE sur TRAIN uniquement (optionnel)
+#     * SMOTE sur TRAIN uniquement (sur Xm=metrics seulement)
 #     * Gaussian noise augmentation sur TRAIN (optionnel)
 #     * class_weight (optionnel)
 # - Calibration: Temperature scaling (fallback Isotonic)
@@ -51,26 +51,22 @@ from wandb.integration.keras import WandbMetricsLogger, WandbModelCheckpoint
 
 ID_COLS = ["project", "version", "class", "bug"]
 
-# Deux configurations prédéfinies d'hyperparamètres pour le modèle Transformer.
-# Permet de changer rapidement de réglage sans modifier le code, juste en
-# choisissant "fast_cpu" ou "balanced" au moment de lancer le script.
+# Deux configurations d'hyperparametres pretes a l'emploi. 
 PRESETS = {
-    # Modèle réduit, moins d'époques pour tester rapidement sans GPU.
-    "fast_cpu": dict(d_model=96, n_layers=2, n_heads=2, d_ff=192, dropout=0.30,
+    "fast_cpu": dict(d_model=96, dropout=0.30,
                     lr=2e-4, weight_decay=2e-4, label_smoothing=0.06,
-                    focal_alpha=0.9, focal_gamma=1.0, batch_size=32, epochs=35),
-    # Configuration complète utilisée pour les résultats du mémoire.
-    "balanced": dict(d_model=128, n_layers=4, n_heads=4, d_ff=256, dropout=0.20,
+                    batch_size=32, epochs=35),
+
+    "balanced": dict(d_model=128, dropout=0.20,
                     lr=2e-4, weight_decay=5e-5, label_smoothing=0.01,
-                    focal_alpha=0.8, focal_gamma=0.5, batch_size=32, epochs=70),
+                    batch_size=32, epochs=70),
 }
 
 
 # ======================== Repro ========================
 
-# Fonction qui fixe la graine aléatoire partout où elle peut intervenir (numpy, tensorflow,
-# hachage Python, module random) -- ce qui garantit des résultats reproductibles
-# d'une exécution à l'autre.
+# Fixe la graine aleatoire partout (numpy, tensorflow, hachage Python,
+# module random) pour des resultats reproductibles d'un run a l'autre.
 def set_all_seeds(seed: int = 2025):
     np.random.seed(seed)
     tf.random.set_seed(seed)
@@ -84,8 +80,7 @@ def set_all_seeds(seed: int = 2025):
 
 # ======================== IO ========================
 
-# Fonction qui charge un CSV en testant plusieurs encodages/separateurs, car les
-# fichiers exportes par le plugin n'ont pas toujours le meme format.
+# Charge un CSV en testant plusieurs encodages/separateurs
 def load_csv(p: Path) -> pd.DataFrame:
     for enc in ("utf-8", "utf-8-sig", "latin1"):
         for sep in (",", ";", "\t"):
@@ -95,7 +90,7 @@ def load_csv(p: Path) -> pd.DataFrame:
                 pass
     return pd.read_csv(p)
 
-# Fonction qui cherche le fichier d'un projet en essayant plusieurs conventions de
+# Cherche le fichier d'un projet en essayant plusieurs conventions de
 # nommage possibles -- retourne le premier qui existe, ou None sinon.
 def resolve_project_file(projects_dir: Path, name: str) -> Path | None:
     candidates = [
@@ -108,7 +103,7 @@ def resolve_project_file(projects_dir: Path, name: str) -> Path | None:
             return c
     return None
 
-# Fonction qui charge et fusionne plusieurs projets en un seul tableau -- affiche un
+# Charge et fusionne plusieurs projets en un seul tableau -- affiche un
 # avertissement pour chaque fichier introuvable plutot que de planter,
 # et s'arrete seulement si aucun projet n'a pu etre charge.
 def assemble(projects_dir: Path, names: list[str]) -> pd.DataFrame:
@@ -125,7 +120,7 @@ def assemble(projects_dir: Path, names: list[str]) -> pd.DataFrame:
         raise SystemExit("ERROR: aucun projet valide fourni.")
     return pd.concat(dfs, ignore_index=True)
 
-# Fonction qui separe automatiquement les colonnes en deux groupes : les descripteurs
+# Separe automatiquement les colonnes en deux groupes : les descripteurs
 # relationnels (celles qui commencent par "deg_") et les metriques
 # logicielles (le reste, en gardant seulement les colonnes numeriques).
 def infer_columns(df: pd.DataFrame):
@@ -134,9 +129,8 @@ def infer_columns(df: pd.DataFrame):
     met = [c for c in met if pd.api.types.is_numeric_dtype(df[c])]
     return met, rel
 
-# Fonction qui transforme la colonne "bug" (un compteur de defauts) en etiquette binaire :
-# 1 si au moins un defaut est reference, 0 sinon (les valeurs manquantes
-# sont traitees comme 0).
+# Transforme la colonne "bug" (un compteur de defauts) en etiquette
+# binaire : 1 si au moins un defaut est reference, 0 sinon.
 def binarize_bug(s: pd.Series) -> np.ndarray:
     s = pd.to_numeric(s, errors="coerce").fillna(0)
     return (s.astype(float) > 0).astype(int).values
@@ -156,17 +150,18 @@ def split_X_y_ids(df: pd.DataFrame, metric_cols, relation_cols):
     )
     return Xm, Xr, y, ids
 
-# Fonction qui divise le pool d'entrainement en train (80%) et validation (20%),
+# Divise le pool d'entrainement en train (80%) et validation (20%),
 # en preservant la proportion de classes bug/sans-bug dans les deux
 # sous-ensembles (split stratifie).
-def pool_split(df_pool: pd.DataFrame, val_size: float = 0.20, seed: int = 2025):
+def pool_split(df_pool: pd.DataFrame, val_size: float = 0.20, seed: int = 42):
     y = binarize_bug(df_pool["bug"])
     sss = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=seed)
     idx_tr, idx_va = next(sss.split(df_pool, y))
     return df_pool.iloc[idx_tr].reset_index(drop=True), df_pool.iloc[idx_va].reset_index(drop=True)
 
 
-# ======================== Model ========================
+# ======================== Utils ========================
+
 # Transforme les etiquettes 0/1 en format one-hot (ex: 0 -> [1,0],
 # 1 -> [0,1]) -- format attendu par la couche de sortie softmax(2).
 def to_onehot(y):
@@ -175,91 +170,9 @@ def to_onehot(y):
     out[np.arange(len(y)), y] = 1.0
     return out
 
-# Fonction qui definit la focal loss, une alternative a l'entropie croisee qui donne
-# plus de poids aux exemples mal classes -- utile en cas de fort
-# desequilibre entre classes (option non utilisee par defaut).
-def focal_loss(alpha=0.45, gamma=0.75):
-    @tf.function
-    def loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        eps = tf.keras.backend.epsilon()
-        y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
-        pt = tf.reduce_sum(y_true * y_pred, axis=-1)
-        w = alpha * tf.pow(1.0 - pt, gamma)
-        return tf.reduce_mean(-w * tf.math.log(pt + eps))
-    return loss
-
-# Un bloc Transformer standard (architecture Pre-LN) : attention
-# multi-tetes avec connexion residuelle, suivie d'un reseau feed-forward
-# avec sa propre connexion residuelle -- ce bloc est repete n_layers fois.
-def transformer_block(x, d_model, n_heads, d_ff, dropout):
-    h = L.LayerNormalization()(x)
-    h = L.MultiHeadAttention(num_heads=n_heads, key_dim=max(1, d_model // n_heads))(h, h)
-    h = L.Dropout(dropout)(h)
-    x = L.Add()([x, h])
-
-    h = L.LayerNormalization()(x)
-    h = L.Dense(d_ff, activation="gelu")(h)
-    h = L.Dropout(dropout)(h)
-    h = L.Dense(d_model)(h)
-    return L.Add()([x, h])
-
-# Fonction qui construit le modele Transformer : chaque descripteur relationnel devient
-# un token, les metriques sont resumees en un seul token, un encodage
-# positionnel est ajoute pour distinguer les tokens entre eux, puis la
-# sequence passe par n_layers blocs Transformer avant la classification.
-def build_transformer(n_rel_dims: int, n_met_dims: int,
-                      d_model=128, n_layers=4, n_heads=4, d_ff=256,
-                      dropout=0.2, l2reg=1e-5):
-    inputs, tokens = [], []
-
-    if n_rel_dims > 0:
-        inp_rel = L.Input(shape=(n_rel_dims,), name="relations")
-        inputs.append(inp_rel)
-        x_rel = L.Lambda(lambda t: tf.expand_dims(t, axis=-1))(inp_rel)
-        x_rel = L.Conv1D(filters=d_model, kernel_size=1, padding="valid",
-                         activation="linear", name="rel_proj_conv1x1")(x_rel)
-        tokens.append(x_rel)
-
-    if n_met_dims > 0:
-        inp_met = L.Input(shape=(n_met_dims,), name="metrics")
-        inputs.append(inp_met)
-        met_proj = L.Dense(d_model, activation="linear", name="met_proj")(inp_met)
-        met_token = L.Lambda(lambda z: tf.expand_dims(z, axis=1), name="metrics_token")(met_proj)
-        tokens.append(met_token)
-
-    if not tokens:
-        raise ValueError("Aucune feature en entrée.")
-
-    x = tokens[0] if len(tokens) == 1 else L.Concatenate(axis=1, name="concat_tokens")(tokens)
-
-    # ============ Correction : encodage positionnel appris ============
-    # Sans ceci, tous les tokens relationnels partagent la même
-    # projection (Conv1D 1x1 a des poids partagés par position) :
-    # le modèle ne peut pas distinguer QUEL descripteur relationnel
-    # chaque token représente. On ajoute donc un vecteur positionnel
-    # entraînable, propre à chaque position de la séquence.
-    seq_len = x.shape[1]
-    pos_embedding_layer = L.Embedding(
-        input_dim=seq_len, output_dim=d_model, name="positional_embedding"
-    )
-    position_ids = tf.range(start=0, limit=seq_len, delta=1)
-    pos_vectors = pos_embedding_layer(position_ids)  # (seq_len, d_model)
-    x = L.Lambda( lambda inputs: inputs[0] + inputs[1], name="add_positional_encoding")([x, pos_vectors])
-    for _ in range(n_layers):
-        x = transformer_block(x, d_model, n_heads, d_ff, dropout)
-
-    x = L.LayerNormalization(name="pre_head_norm")(x)
-    x = L.GlobalAveragePooling1D(name="gap")(x)
-    x = L.Dropout(dropout, name="head_dropout")(x)
-    out = L.Dense(2, activation="softmax",
-                  kernel_regularizer=regularizers.l2(l2reg),
-                  name="head")(x)
-    return Model(inputs=inputs, outputs=out)
-
-# Fonction qui prepare les donnees dans le format attendu par le modele : une liste
+# Prepare les donnees dans le format attendu par le modele : une liste
 # [relations, metriques] si les deux existent, ou une seule des deux
-# sinon -- correspond a l'ordre des entrees definies dans build_transformer.
+# sinon.
 def pack_input(Xr, Xm):
     if Xr.shape[1] > 0 and Xm.shape[1] > 0:
         return [Xr, Xm]
@@ -267,38 +180,58 @@ def pack_input(Xr, Xm):
         return Xr
     return Xm
 
-# Fonction qui construit le modele Transformer avec les hyperparametres choisis
-# (issus d'un preset comme "balanced"), avant de le compiler.
-def compile_model(nr, nm, hp, use_focal):
-    model = build_transformer(
-        nr, nm,
-        d_model=hp["d_model"],
-        n_layers=hp["n_layers"],
-        n_heads=hp["n_heads"],
-        d_ff=hp["d_ff"],
-        dropout=hp["dropout"],
-        l2reg=1e-5
-    )
 
-    loss_fn = focal_loss(alpha=hp["focal_alpha"], gamma=hp["focal_gamma"]) if use_focal \
-        else tf.keras.losses.CategoricalCrossentropy(label_smoothing=hp["label_smoothing"])
+# ======================== CNN Model ========================
 
-    opt = optimizers.AdamW(learning_rate=hp["lr"], weight_decay=hp["weight_decay"])
+# Construit le modele CNN a deux branches : une branche convolutionnelle
+# pour les relations (motifs locaux via Conv1D kernel=3), et une branche
+# perceptron (Dense) pour les metriques -- les deux sont ensuite
+# concatenees avant la classification finale.
+def build_cnn(n_rel_dims: int, n_met_dims: int, d_model=128, dropout=0.2, l2reg=1e-5):
+    inputs = []
+    branches = []
 
-    model.compile(
-        optimizer=opt,
-        loss=loss_fn,
-        metrics=[
-            tf.keras.metrics.AUC(name="auc_roc", curve="ROC"),
-            tf.keras.metrics.AUC(name="auc_pr", curve="PR"),
-        ],
-    )
-    return model
+    # Branche relations (Conv1D) : detecte des motifs locaux entre
+    # descripteurs relationnels voisins (kernel_size=3), avec deux
+    # couches de convolution separees par un MaxPooling.
+    if n_rel_dims > 0:
+        inp_rel = L.Input(shape=(n_rel_dims,), name="relations")
+        x = L.Reshape((n_rel_dims, 1), name="rel_reshape")(inp_rel)
+        x = L.Conv1D(d_model // 2, 3, padding="same", activation="relu",
+                     kernel_regularizer=regularizers.l2(l2reg))(x)
+        x = L.MaxPooling1D(2)(x)
+        x = L.Conv1D(d_model, 3, padding="same", activation="relu",
+                     kernel_regularizer=regularizers.l2(l2reg))(x)
+        x = L.GlobalAveragePooling1D()(x)
+        x = L.Dropout(dropout)(x)
+        inputs.append(inp_rel)
+        branches.append(x)
+
+    # Branche metriques (perceptron simple, sans convolution -- les
+    # metriques ne forment pas une sequence spatiale).
+    if n_met_dims > 0:
+        inp_met = L.Input(shape=(n_met_dims,), name="metrics")
+        y = L.Dense(d_model // 2, activation="relu", kernel_regularizer=regularizers.l2(l2reg))(inp_met)
+        y = L.Dropout(dropout)(y)
+        y = L.Dense(d_model // 2, activation="relu", kernel_regularizer=regularizers.l2(l2reg))(y)
+        inputs.append(inp_met)
+        branches.append(y)
+
+    if not branches:
+        raise ValueError("Aucune feature en entrée.")
+
+    # Fusion des deux branches (deja resumees en vecteurs) puis
+    # classification finale.
+    z = branches[0] if len(branches) == 1 else L.Concatenate(name="concat")(branches)
+    z = L.Dense(d_model, activation="relu", kernel_regularizer=regularizers.l2(l2reg))(z)
+    z = L.Dropout(dropout)(z)
+    out = L.Dense(2, activation="softmax", name="head")(z)
+    return Model(inputs=inputs, outputs=out)
 
 
 # ======================== Imbalance helpers ========================
 
-# Fonction qui calcule un poids par classe pour compenser le desequilibre bug/sans-bug
+# Calcule un poids par classe pour compenser le desequilibre bug/sans-bug
 # (plus de poids sur la classe minoritaire) -- retourne None si desactive.
 def get_class_weight(y, use=True):
     if not use:
@@ -307,13 +240,11 @@ def get_class_weight(y, use=True):
     weights = compute_class_weight(class_weight="balanced", classes=classes, y=y)
     return {int(c): float(w) for c, w in zip(classes, weights)}
 
-# Fonction qui genere de nouveaux exemples "bug" en dupliquant des exemples existants
-# et en ajoutant un leger bruit aleatoire -- une autre facon d'augmenter
-# la classe minoritaire, complementaire a SMOTE.
+# Genere de nouveaux exemples "bug" en dupliquant des exemples existants
+# et en ajoutant un leger bruit aleatoire -- complementaire a SMOTE.
 def augment_minority_gaussian(Xm, Xr, y, std=0.02, factor=0.5, seed=42):
     if std <= 0 or factor <= 0:
         return Xm, Xr, y
-
     rng = np.random.default_rng(seed)
     bug_idx = np.where(y == 1)[0]
     if len(bug_idx) == 0:
@@ -337,21 +268,14 @@ def augment_minority_gaussian(Xm, Xr, y, std=0.02, factor=0.5, seed=42):
     y_aug = np.concatenate([y, y_new])
     return Xm_aug, Xr_aug, y_aug
 
-# Fonction qui applique SMOTE (uniquement sur les metriques, jamais sur les relations)
+# Applique SMOTE (uniquement sur les metriques, jamais sur les relations)
 # pour generer des exemples "bug" synthetiques -- les relations sont
 # dupliquees depuis un exemple reel pour garder la correspondance.
 # Reduit automatiquement k_neighbors si trop peu d'exemples minoritaires,
-# pour eviter un plantage.
+# pour eviter un plantage. Identique au script Transformer.
 def apply_smote_train_only(Xm, Xr, y, seed=42, k_neighbors=5):
-    """
-    SMOTE sur TRAIN uniquement.
-    IMPORTANT: on n'applique SMOTE QUE sur Xm (metrics), pas sur Xr (relations),
-    car Xr peut contenir des features pseudo-discrètes / comptages.
-    On réplique ensuite Xr pour garder la correspondance.
-    """
     if SMOTE is None:
-        raise SystemExit("imblearn n'est pas installé.")
-
+        raise SystemExit("imblearn n'est pas installé. Fais: pip install imbalanced-learn")
     if Xm.shape[1] == 0:
         return Xm, Xr, y
 
@@ -378,22 +302,19 @@ def apply_smote_train_only(Xm, Xr, y, seed=42, k_neighbors=5):
     sel = rng.choice(bug_idx, size=n_new, replace=True)
     Xr_new = Xr[sel].copy() if Xr.shape[1] else Xr
     Xr_res = np.vstack([Xr, Xr_new]) if Xr.shape[1] else Xr
-
     return Xm_res, Xr_res, y_res
 
-# ======================== Calibration ========================
+# ======================== Calibration (same as Transformer) ========================
 
-# Fonction qui convertit une probabilite (entre 0 et 1) en logit -- l'operation
-# inverse d'une sigmoide necessaire pour appliquer le temperature
-# scaling lors de la calibration.
+# Convertit une probabilite en logit -- operation inverse d'une sigmoide,
+# necessaire pour le temperature scaling.
 def _to_logits_from_probs(p):
     eps = np.finfo(np.float32).eps
     p = np.clip(p, eps, 1.0 - eps)
     return np.log(p) - np.log(1.0 - p)
 
 # Calcule l'erreur de calibration (log-loss binaire) entre les vraies
-# etiquettes et les probabilites predites -- sert a evaluer differentes
-# valeurs de temperature pendant la calibration.
+# etiquettes et les probabilites predites.
 def _binary_nll(y_true, p):
     eps = 1e-12
     return -np.mean(
@@ -401,10 +322,8 @@ def _binary_nll(y_true, p):
         (1 - y_true) * np.log(np.clip(1 - p, eps, 1 - eps))
     )
 
-# Fonction qui cherche la meilleure valeur de temperature pour calibrer les
-# probabilites : teste une grille de valeurs, garde celle qui minimise
-# l'erreur (_binary_nll), puis affine la recherche autour du meilleur
-# resultat trouve.
+# Cherche la meilleure temperature de calibration par recherche en
+# grille, puis affine autour du meilleur resultat trouve.
 def fit_temperature_scaling_grid(y_true, p_val):
     z = _to_logits_from_probs(p_val)
 
@@ -431,37 +350,28 @@ def fit_temperature_scaling_grid(y_true, p_val):
 
     return float(max(0.05, min(10.0, best_T)))
 
-# Fonction qui applique la temperature deja trouvee a de nouvelles probabilites
-# (validation ou test) -- rend les probabilites plus ou moins
-# confiantes, sans jamais changer le classement des exemples entre eux.
+# Applique la temperature deja trouvee a de nouvelles probabilites,
+# sans jamais changer le classement des exemples entre eux.
 def apply_temperature_scaling(p, T):
     z = _to_logits_from_probs(p)
     out = 1.0 / (1.0 + np.exp(-z / T))
     return np.clip(out, 1e-6, 1 - 1e-6)
 
-# Fonction qui ajuste une regression isotone comme methode de calibration de repli,
-# plus flexible que le temperature scaling -- utilisee quand la
-# temperature trouvee sort d'une plage raisonnable.
+# Ajuste une regression isotone comme methode de calibration de repli,
+# utilisee quand la temperature trouvee sort d'une plage raisonnable.
 def fit_isotonic(y_true, p_val):
     from sklearn.isotonic import IsotonicRegression
     ir = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
     ir.fit(p_val, y_true)
     return ir
 
-# Fonction applique la regression isotone deja ajustee a de nouvelles
-# probabilites (validation ou test).
+# Applique la regression isotone deja ajustee a de nouvelles probabilites.
 def apply_isotonic(ir, p):
     return np.clip(ir.predict(p), 1e-6, 1 - 1e-6)
 
 # Choisit et applique la meilleure methode de calibration sur la
-# validation : temperature scaling si la temperature trouvee reste
-# raisonnable (<= calib_T_max), sinon repli sur la regression isotone.
-# Retourne les probabilites calibrees et les infos necessaires pour
-# reappliquer la meme calibration plus tard sur le test.
+# validation : temperature scaling si raisonnable, sinon repli isotone.
 def calibrate_probs(y_va, p_val, calib="temp", calib_T_max=3.0):
-    """
-    Retourne: p_val_cal, calib_info(dict)
-    """
     T_used, iso_model = None, None
 
     if calib == "temp":
@@ -486,17 +396,21 @@ def calibrate_probs(y_va, p_val, calib="temp", calib_T_max=3.0):
     return p_cal, info, T_used, iso_model
 
 
-# ======================== Thresholding ========================
+# ======================== Thresholding (same as Transformer) ========================
 
+# Trouve le seuil correspondant a une proportion cible de predictions
+# positives (PPR = Predicted Positive Rate).
 def threshold_fix_ppr(p, ppr_target: float):
     ppr_target = float(np.clip(ppr_target, 0.01, 0.99))
     thr = float(np.quantile(p, 1.0 - ppr_target))
     ppr_emp = float(np.mean(p >= thr))
     return thr, ppr_emp
 
+# Teste tous les seuils possibles et retourne celui qui maximise le
+# critere choisi (F1, F0.5, ou une precision minimale visee) -- calcule
+# sur la validation, jamais sur le test.
 def choose_threshold(y_true, y_prob, mode="f1", target_p=0.6):
     p, r, t = precision_recall_curve(y_true, y_prob)
-    # t has len(p)-1
     prec = p[:-1]
     rec = r[:-1]
     thr = t
@@ -522,10 +436,9 @@ def choose_threshold(y_true, y_prob, mode="f1", target_p=0.6):
 
 # ======================== Evaluation ========================
 
-# Fonction qui applique un seuil de decision aux probabilites pour obtenir des
+# Applique un seuil de decision aux probabilites pour obtenir des
 # predictions binaires, puis calcule toutes les metriques d'evaluation
-# (exactitude, precision, rappel, F1, AUC-ROC, AUC-PR) et la matrice
-# de confusion.
+# et la matrice de confusion.
 def classify_at_threshold(y_true, y_prob, thr):
     y_pred = (y_prob >= thr).astype(int)
     cm = confusion_matrix(y_true, y_pred)
@@ -545,9 +458,8 @@ def classify_at_threshold(y_true, y_prob, thr):
 
 # ======================== Scalers ========================
 
-# Fonction qui cree les deux normaliseurs (metriques et relations) selon le type
-# choisi : QuantileTransformer (rend la distribution plus normale) ou
-# StandardScaler (moyenne 0, ecart-type 1) par defaut.
+# Cree les deux normaliseurs (metriques et relations) : QuantileTransformer
+# (rend la distribution plus normale) ou StandardScaler par defaut.
 def make_scalers(kind):
     if kind == "quantile":
         sm = QuantileTransformer(output_distribution="normal", random_state=42)
@@ -558,14 +470,11 @@ def make_scalers(kind):
     return sm, sr
 
 
-# ======================== W&B plots ========================
+# ======================== W&B plots (same as Transformer) ========================
 
-# Fonction qui genere et envoie a wandb plusieurs graphiques de diagnostic : courbe
-# precision-rappel, courbe ROC, et l'evolution de precision/rappel/F1
-# selon le seuil choisi -- purement pour la visualisation, n'affecte
-# pas l'entrainement ni les resultats.
+# Genere et envoie a wandb les courbes de diagnostic : precision-rappel,
+# ROC, et l'evolution des scores selon le seuil -- purement visuel.
 def wandb_log_pr_roc_threshold(y_true, y_prob, prefix="test"):
-    # PR curve
     p, r, t = precision_recall_curve(y_true, y_prob)
     fig = plt.figure()
     plt.plot(r, p)
@@ -573,7 +482,6 @@ def wandb_log_pr_roc_threshold(y_true, y_prob, prefix="test"):
     wandb.log({f"{prefix}/pr_curve": wandb.Image(fig)})
     plt.close(fig)
 
-    # ROC curve
     fpr, tpr, _ = roc_curve(y_true, y_prob)
     fig = plt.figure()
     plt.plot(fpr, tpr)
@@ -581,7 +489,6 @@ def wandb_log_pr_roc_threshold(y_true, y_prob, prefix="test"):
     wandb.log({f"{prefix}/roc_curve": wandb.Image(fig)})
     plt.close(fig)
 
-    # Threshold curves
     thr = t
     prec = p[:-1]
     rec = r[:-1]
@@ -602,9 +509,9 @@ def wandb_log_pr_roc_threshold(y_true, y_prob, prefix="test"):
     wandb.log({f"{prefix}/threshold_curves": wandb.Image(fig)})
     plt.close(fig)
 
-# Fonction qui genere un histogramme des probabilites predites, separe par vraie
-# classe (sans bug vs bug) permet de visualiser si le modele separe
-# bien les deux distributions de scores.
+# Genere un histogramme des probabilites predites, separe par vraie
+# classe -- permet de visualiser si le modele separe bien les deux
+# distributions de scores.
 def wandb_log_hist(y_true, y_prob, prefix="test"):
     fig = plt.figure()
     plt.hist(y_prob[y_true == 0], bins=40, alpha=0.7, label="clean")
@@ -618,10 +525,7 @@ def wandb_log_hist(y_true, y_prob, prefix="test"):
 
 # ======================== Args ========================
 
-# Fonction qui definit tous les arguments qu'on peut passer au script en ligne de
-# commande (dossier des donnees, pool d'entrainement, projet de test,
-# hyperparametres, options de calibration et de seuil, config wandb...)
-# -- c'est ce qui permet de lancer chaque run sans modifier le code.
+# Definit tous les arguments passables en ligne de commande. 
 def build_parser():
     ap = argparse.ArgumentParser()
 
@@ -634,7 +538,6 @@ def build_parser():
     ap.add_argument("--test", nargs="+", required=True)
 
     ap.add_argument("--preset", choices=list(PRESETS.keys()), default="balanced")
-    ap.add_argument("--use_focal", action="store_true")
 
     ap.add_argument("--scaler", choices=["standard", "quantile"], default="quantile")
 
@@ -646,7 +549,7 @@ def build_parser():
     ap.add_argument("--bug_aug_std", type=float, default=0.02)
     ap.add_argument("--bug_aug_factor", type=float, default=0.4)
 
-    # calibration & threshold
+    # calibration & threshold (IDENTIQUE TRANSFORMER)
     ap.add_argument("--calib", choices=["none", "temp", "isotonic"], default="temp")
     ap.add_argument("--calib_T_max", type=float, default=3.0)
 
@@ -659,11 +562,11 @@ def build_parser():
 
     # wandb
     ap.add_argument("--use_wandb", action="store_true")
-    ap.add_argument("--wandb_project", default="bug-prediction-transformer")
+    ap.add_argument("--wandb_project", default="bug-prediction-cnn_final")
     ap.add_argument("--wandb_group", default=None)
     ap.add_argument("--wandb_name", default=None)
     ap.add_argument("--wandb_tags", nargs="*", default=[])
-    ap.add_argument("--model_name", default="transformer")
+    ap.add_argument("--model_name", default="bug_cnn")
 
     ap.add_argument("--seed", type=int, default=42)
     return ap
@@ -673,9 +576,9 @@ def build_parser():
 
 # Fonction principale qui execute un run complet, du chargement des
 # donnees jusqu'a la sauvegarde des resultats : construit le pool sans
-# fuite, normalise, gere le desequilibre, entraine le modele, calibre
-# les probabilites sur la validation, choisit le seuil, puis evalue et
-# enregistre tout sur le projet cible (jamais vu par le modele).
+# fuite, normalise, gere le desequilibre, entraine le modele CNN,
+# calibre les probabilites, choisit le seuil, puis evalue et enregistre
+# tout sur le projet cible (jamais vu par le modele).
 def run(args: argparse.Namespace):
     set_all_seeds(args.seed)
     print(f"[SEED] {args.seed}")
@@ -729,17 +632,13 @@ def run(args: argparse.Namespace):
     if args.use_smote:
         print("[SMOTE] actif (TRAIN only)")
         Xm_tr, Xr_tr, y_tr = apply_smote_train_only(
-            Xm_tr, Xr_tr, y_tr,
-            seed=args.seed,
-            k_neighbors=args.smote_k
+            Xm_tr, Xr_tr, y_tr, seed=args.seed, k_neighbors=args.smote_k
         )
 
     # 6) Desequilibre : augmentation gaussienne (TRAIN uniquement)
     Xm_tr, Xr_tr, y_tr = augment_minority_gaussian(
         Xm_tr, Xr_tr, y_tr,
-        std=args.bug_aug_std,
-        factor=args.bug_aug_factor,
-        seed=args.seed
+        std=args.bug_aug_std, factor=args.bug_aug_factor, seed=args.seed
     )
 
     # 7) Initialisation W&B
@@ -759,9 +658,27 @@ def run(args: argparse.Namespace):
             }
         )
 
-    # 8) Entrainement
+    # 8) Construction + compilation du modele CNN (selon le preset)
     hp = PRESETS[args.preset]
-    model = compile_model(Xr_tr.shape[1], Xm_tr.shape[1], hp, args.use_focal)
+    model = build_cnn(
+        n_rel_dims=Xr_tr.shape[1],
+        n_met_dims=Xm_tr.shape[1],
+        d_model=hp["d_model"],
+        dropout=hp["dropout"],
+        l2reg=1e-5,
+    )
+
+    loss_fn = tf.keras.losses.CategoricalCrossentropy(label_smoothing=hp["label_smoothing"])
+    opt = optimizers.AdamW(learning_rate=hp["lr"], weight_decay=hp["weight_decay"])
+
+    model.compile(
+        optimizer=opt,
+        loss=loss_fn,
+        metrics=[
+            tf.keras.metrics.AUC(name="auc_roc", curve="ROC"),
+            tf.keras.metrics.AUC(name="auc_pr", curve="PR"),
+        ],
+    )
 
     cbs = [
         callbacks.ReduceLROnPlateau(monitor="val_auc_pr", mode="max", factor=0.5, patience=5, verbose=1),
@@ -785,7 +702,7 @@ def run(args: argparse.Namespace):
     if cw is not None:
         print(f"[CLASS_WEIGHT] {cw}")
 
-    hist = model.fit(
+    model.fit(
         pack_input(Xr_tr, Xm_tr), to_onehot(y_tr),
         validation_data=(pack_input(Xr_va, Xm_va), to_onehot(y_va)),
         epochs=hp["epochs"],
@@ -850,7 +767,6 @@ def run(args: argparse.Namespace):
                 class_names=["clean", "bug"]
             )
         })
-
         wandb_log_pr_roc_threshold(y_te, p_te_cal, prefix="test")
         wandb_log_hist(y_te, p_te_cal, prefix="test")
 
@@ -888,50 +804,50 @@ if __name__ == "__main__":
     parser = build_parser()
     if len(sys.argv) == 1:
         # Configuration par defaut utilisee si le script est lance sans
-        # aucun argument -- pratique pour tester rapidement depuis
-        # l'editeur, mais ignoree des qu'on passe des arguments (comme
-        # le fait run_all.py).
+        # aucun argument -- ignoree des qu'on passe des arguments (comme
+        # le fait run_all.py). Note : "velocity_v2" (le test) n'apparait
+        # pas dans le pool -- pas de fuite dans ce bloc precis.
         args = argparse.Namespace(
             projects_dir=r".\données_final",
             pool=[
-                "jedit_v2", "jedit_v4", "jedit_v3",
-               "camel_v1","camel_v2","log4j_v1",
-                "synapse_v1", "synapse_v2",
-                "ant_v1", "ant_v2", "ant_v4","log4j_v1",
-                "poi_v2", "poi_v3"
-                
+                "jedit_v1", "jedit_v2", "jedit_v3",
+                "camel_v1", "camel_v2",
+                "xerces_v1", "xerces_v2",
+                "synapse_v1", "synapse_v3",
+                "ant_v1", "ant_v2", "ant_v3",
+                "log4j_v1", "log4j_v3",
+                "xalan_v1", "xalan_v2",
+                "lucene_v2", "lucene_v1", "poi_v2", "poi_v3"
             ],
             pool_val_size=0.20,
             train=None, val=None,
-            test=["xalan_v4"],
+            test=["velocity_v2"],
 
             preset="balanced",
-            use_focal=False,
 
             scaler="quantile",
-
             use_class_weight=True,
             use_smote=True,
             smote_k=5,
-
             bug_aug_std=0.02,
             bug_aug_factor=0.4,
-
             calib="temp",
             calib_T_max=3.0,
-
             decision_mode="f1",
             precision_target=0.70,
             ppr_target=None,
-            out_dir="runs/Transformer",
+            out_dir="runs/CNN",
             use_wandb=True,
-            wandb_project="bug-prediction-transformer_final",
+            wandb_project="bug-prediction-cnn_final",
             wandb_group="Memoire_2026",
-            wandb_name="xalan_V4_F1",
+            wandb_name="test_velocity_v2_F1",
             wandb_tags=["smote", "temp_scaling", "threshold_f1"],
-            model_name="bug_transformer",
+            model_name="bug_cnn",
             seed=2025,
         )
         run(args)
     else:
+        # Cas normal : les arguments passes en ligne de commande (via
+        # generate_pools.py ou run_all.py) remplacent la configuration
+        # par defaut ci-dessus.
         run(parser.parse_args())

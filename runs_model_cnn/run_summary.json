@@ -1,0 +1,49 @@
+{
+  "mode": "pool",
+  "threshold": 0.3899237811565399,
+  "threshold_crit": "F1",
+  "test_metrics": {
+    "accuracy": 0.5853658536585366,
+    "precision_pos": 0.5636363636363636,
+    "recall_pos": 0.7560975609756098,
+    "f1_pos": 0.6458333333333334,
+    "auc_pr": 0.6303552101837269,
+    "auc_roc": 0.6258179654967282
+  },
+  "n_metrics": 9,
+  "n_relations": 14,
+  "train": null,
+  "val": null,
+  "test": [
+    "poi_v3"
+  ],
+  "pool": [
+    "jedit_v1",
+    "jedit_v2",
+    "jedit_v4",
+    "camel_v1",
+    "camel_v2",
+    "xerces_v1",
+    "xerces_v2",
+    "synapse_v1",
+    "synapse_v3",
+    "log4j_v1",
+    "log4j_v2",
+    "velocity_v1",
+    "xalan_v1",
+    "xalan_v2",
+    "xalan_v4",
+    "lucene_v2",
+    "lucene_v3",
+    "poi_v1",
+    "poi_v2",
+    "ant_v1",
+    "ant_v2",
+    "ant_v4"
+  ],
+  "seed": 2025,
+  "scaler": "quantile",
+  "use_class_weight": true,
+  "decision_mode": "f1",
+  "precision_target": 0.8
+}
