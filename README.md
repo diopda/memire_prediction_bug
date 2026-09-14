@@ -2,7 +2,7 @@
 
 Mémoire de maîtrise (MMIA) — UQTR
 Auteur : Dadah Diop
-Directeur de recherche : Fadel Touré
+
 
 ## Vue d'ensemble
 
